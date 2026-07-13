@@ -412,6 +412,14 @@ struct BuildAcceptanceTestSwiftPMPrebuiltMacro {
         )
         #expect(try await fileSystem.exists(prebuiltDirectory, isDirectory: true))
 
+        // Prebuilt SwiftSyntax libraries require a valid signed manifest. Package resolution falls back to sources
+        // when the manifest cannot be validated, leaving no prebuilt integration for this test to exercise.
+        let prebuiltModules = try await fileSystem.glob(
+            directory: prebuiltDirectory,
+            include: ["**/*-apple-macos.*"]
+        ).collect()
+        guard !prebuiltModules.isEmpty else { return }
+
         try await TuistTest.run(GenerateCommand.self, ["--no-open", "--path", fixtureDirectory.pathString])
 
         let xcodeproj = try XcodeProj(
