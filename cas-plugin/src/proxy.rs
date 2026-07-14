@@ -16,12 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crate::prefetch::Prefetcher;
 use crate::proxy_proto::{
     read_request, write_response, Request, OP_FETCH_OBJECT, OP_INVALIDATE, OP_PUBLISH, OP_RESOLVE,
-    STATUS_ERROR,
-    STATUS_HIT, STATUS_MISS,
+    STATUS_ERROR, STATUS_HIT, STATUS_MISS,
 };
-use crate::prefetch::Prefetcher;
 use crate::reapi::{self, ManifestEntry, Remote, RemoteConfig};
 use crate::token::TokenProvider;
 use crate::types::*;
@@ -52,12 +51,34 @@ const SNAPSHOT_DELTA_INTERVAL: Duration = Duration::from_secs(120);
 const SNAPSHOT_FETCH_WAIT: Duration = Duration::from_secs(20);
 const SNAPSHOT_FULL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+// Ceiling on a compressed snapshot's declared uncompressed size, so a torn or
+// hostile length prefix cannot drive an unbounded allocation. Comfortably
+// above the server's content budget (144 MiB); a legitimate body never
+// approaches it.
+const SNAPSHOT_DECOMPRESS_MAX_BYTES: usize = 512 << 20;
+// A leader that finds itself alone lingers this long before firing, giving a
+// near-simultaneous straggler time to join its batch. Once batches flow the
+// followers accumulating during each round trip carry the coalescing, so this
+// only pays out at the very start and end of a demand burst; kept far below a
+// WAN round trip so a lone fetch is barely delayed.
+const DEMAND_BATCH_LINGER: Duration = Duration::from_millis(3);
+// Failed fetches retry much sooner than definitive not-found: the server
+// answers UNAVAILABLE while it builds a large namespace's snapshot index,
+// and timeouts/transport errors are transient by the same token.
+const SNAPSHOT_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const SNAPSHOT_IDLE_EVICT: Duration = Duration::from_secs(60 * 60);
 const SNAPSHOT_MAX_INSTANCES: usize = 8;
 // The bulk-warm budget, in value-graph nodes (each node is one blob fetch).
 // Sized past the largest closure a single build replays (~37.5k on the CLI
 // fixture) so a right-sized namespace still warms completely.
 const PREMATERIALIZE_MAX_NODES: usize = 60_000;
+// View refresh: per-key hits taken while a snapshot was Ready get their
+// manifests re-published in the background (see Proxy.view_refresh). The
+// per-tick batch keeps a full cold build's backlog (~10k keys) draining in
+// well under an hour without contending with the build's own traffic; the
+// queue cap bounds memory if the server never accepts them.
+const VIEW_REFRESH_PER_TICK: usize = 100;
+const VIEW_REFRESH_MAX_QUEUE: usize = 50_000;
 
 /// How long a cached miss is served before it is re-resolved. Positive results
 /// are content-addressed and kept forever; only negatives expire, so a key
@@ -152,7 +173,10 @@ fn cas_generation(cas_path: &str) -> Option<CasGeneration> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Some(CasGeneration { ino: meta.ino(), birth_nanos })
+    Some(CasGeneration {
+        ino: meta.ino(),
+        birth_nanos,
+    })
 }
 
 /// Whether the CAS directory changed identity between two observations, i.e. it
@@ -296,15 +320,59 @@ enum SnapshotState {
     },
     Absent {
         checked: Instant,
+        /// How long to sit on the per-key path before refetching. An hour
+        /// when the server definitively has no snapshot support (not-found);
+        /// one minute when the fetch ERRORED — errors are transient by
+        /// nature (kura answers UNAVAILABLE while a large namespace's
+        /// first-ever index build runs, and it completes within a few of
+        /// these ticks), and an hour of per-key traffic was the cost of
+        /// treating them as permanent.
+        retry_after: Duration,
     },
 }
 
 impl Snapshot {
-    /// Decodes the server's snapshot wire format: `"TSNP"` + version byte,
-    /// u64 write-time watermark, node table, per-key node-index lists. `None`
-    /// on any structural violation — the caller stays on the per-key path
-    /// rather than trusting a torn payload.
+    /// Decodes the server's snapshot response. A `"TSNZ"` envelope (magic,
+    /// version byte, u64 uncompressed length, zstd stream) — what current kura
+    /// always emits — is decompressed into a `"TSNP"` body first; a bare
+    /// `"TSNP"` body, which only an OLD kura pod emits (mid mesh-roll, or a
+    /// lagging self-hosted node), is decoded directly. Any structural violation
+    /// returns `None` and the caller stays on the per-key path rather than
+    /// trusting a torn payload.
     fn decode(bytes: &[u8]) -> Option<Snapshot> {
+        if bytes.len() >= 13 && &bytes[..4] == b"TSNZ" {
+            if bytes[4] != 1 {
+                return None;
+            }
+            let declared = u64::from_le_bytes(bytes[5..13].try_into().ok()?) as usize;
+            if declared > SNAPSHOT_DECOMPRESS_MAX_BYTES {
+                return None;
+            }
+            // Decode the stream through a reader capped at `declared + 1` bytes,
+            // so a payload whose stream expands PAST its declared length (a zip
+            // bomb, or a corrupt frame) is rejected after one extra byte rather
+            // than allocating unboundedly. `decode_all` expands the whole stream
+            // into a Vec first — the length check below never gets to run. The
+            // cap is `declared + 1 <= SNAPSHOT_DECOMPRESS_MAX_BYTES + 1`, so the
+            // allocation is bounded regardless of what the stream claims.
+            use std::io::Read as _;
+            let mut decoder = zstd::stream::read::Decoder::new(&bytes[13..]).ok()?;
+            let mut body = Vec::new();
+            decoder
+                .take(declared as u64 + 1)
+                .read_to_end(&mut body)
+                .ok()?;
+            if body.len() != declared {
+                return None;
+            }
+            return Self::decode_body(&body);
+        }
+        Self::decode_body(bytes)
+    }
+
+    /// Decodes a bare `"TSNP"` body: `"TSNP"` + version byte, u64 write-time
+    /// watermark, node table, per-key node-index lists.
+    fn decode_body(bytes: &[u8]) -> Option<Snapshot> {
         fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
             if bytes.len() < n {
                 return None;
@@ -481,6 +549,125 @@ fn committable(observed: u64, current: u64) -> bool {
 unsafe impl Send for PathState {}
 unsafe impl Sync for PathState {}
 
+/// One queued view refresh: the instance's client, the action key, and the
+/// manifest to re-publish.
+type ViewRefresh = (Arc<Remote>, Vec<u8>, Vec<ManifestEntry>);
+
+/// Result of a coalesced demand fetch, taken by exactly one waiter.
+enum DemandResult {
+    Present(Vec<u8>),
+    Missing,
+    Failed(String),
+}
+
+/// Coalesces concurrent single-object demand fetches (OP_FETCH_OBJECT, one per
+/// compiler worker that outran the materializer) into shared `BatchReadBlobs`
+/// calls. A demand build fetched ~7000 objects one round trip each over the
+/// WAN; the RTT, not bandwidth, dominated that time. Compiler workers issue
+/// their misses in parallel, so a leader drains everything pending into one
+/// batch while followers accumulate during its round trip — the batch size
+/// self-clocks to the worker concurrency with no fixed wait.
+#[derive(Default)]
+struct DemandBatch {
+    /// Digests waiting to be fetched, deduped by hash.
+    pending: HashMap<String, reapi::Digest>,
+    /// Fetched results keyed by hash; each removed by the waiter that wanted it.
+    results: HashMap<String, DemandResult>,
+    /// Whether a leader is currently draining/fetching.
+    leader_active: bool,
+}
+
+struct DemandCoalescer {
+    batch: Mutex<DemandBatch>,
+    ready: Condvar,
+}
+
+impl DemandCoalescer {
+    fn new() -> DemandCoalescer {
+        DemandCoalescer {
+            batch: Mutex::new(DemandBatch::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Fetches one blob, coalescing with concurrent callers into shared batch
+    /// reads. `fetch_batch` performs the actual multi-blob read; only the
+    /// leader of each batch invokes it, and every caller passes the same
+    /// closure (a read against the shared remote), so which thread leads does
+    /// not matter. Blocking here is free: the caller is a compiler worker
+    /// thread that a demand load already parks on network I/O.
+    ///
+    /// Each result is a one-shot mailbox consumed by the first thread to read
+    /// it, so two threads demanding the SAME digest concurrently may each
+    /// fetch it — a rare redundant read, never a wrong or dropped result.
+    fn fetch<F>(&self, digest: &reapi::Digest, fetch_batch: F) -> Result<Option<Vec<u8>>, String>
+    where
+        F: Fn(&[reapi::Digest]) -> Result<HashMap<String, Vec<u8>>, String>,
+    {
+        let hash = digest.hash.clone();
+        let mut batch = self.batch.lock().unwrap();
+        loop {
+            if let Some(result) = batch.results.remove(&hash) {
+                // Drop any pending entry we (or a same-hash sibling) registered
+                // but that another leader's fetch already satisfied — otherwise
+                // it lingers and a later batch re-fetches it, leaking its result.
+                batch.pending.remove(&hash);
+                return match result {
+                    DemandResult::Present(bytes) => Ok(Some(bytes)),
+                    DemandResult::Missing => Ok(None),
+                    DemandResult::Failed(message) => Err(message),
+                };
+            }
+            batch.pending.insert(hash.clone(), digest.clone());
+            if batch.leader_active {
+                // A leader is draining/fetching; wait for it to fill results.
+                batch = self.ready.wait(batch).unwrap();
+                continue;
+            }
+            // Lead this batch. If alone, linger briefly so a near-simultaneous
+            // straggler can join; once batches flow the accumulation during the
+            // previous round trip means we are rarely alone.
+            batch.leader_active = true;
+            if batch.pending.len() == 1 {
+                drop(batch);
+                std::thread::sleep(DEMAND_BATCH_LINGER);
+                batch = self.batch.lock().unwrap();
+            }
+            let digests: Vec<reapi::Digest> = batch.pending.values().cloned().collect();
+            let hashes: Vec<String> = batch.pending.keys().cloned().collect();
+            batch.pending.clear();
+            drop(batch);
+
+            // Network round trip outside the lock so followers keep queueing.
+            let fetched = fetch_batch(&digests);
+
+            batch = self.batch.lock().unwrap();
+            match fetched {
+                Ok(mut map) => {
+                    for hash in hashes {
+                        let result = match map.remove(&hash) {
+                            Some(bytes) => DemandResult::Present(bytes),
+                            None => DemandResult::Missing,
+                        };
+                        batch.results.insert(hash, result);
+                    }
+                }
+                Err(message) => {
+                    for hash in hashes {
+                        batch
+                            .results
+                            .insert(hash, DemandResult::Failed(message.clone()));
+                    }
+                }
+            }
+            batch.leader_active = false;
+            self.ready.notify_all();
+            // Loop: our own hash is now in results (or a follower took it and
+            // we re-enqueue for the next batch — correct either way).
+        }
+    }
+}
+
 pub struct Proxy {
     grpc_url: String,
     tokens: Arc<TokenProvider>,
@@ -524,6 +711,23 @@ pub struct Proxy {
     // when the server has none) resolves use the per-key path.
     snapshots: Mutex<HashMap<String, SnapshotState>>,
 
+    // Keys answered by a per-key lookup while a snapshot was Ready: they fell
+    // out of the server's size-capped wire view, which ranks by version — a
+    // rank publish-dedup never refreshes, so a project's stable keys decay
+    // out of the view and every cold machine pays a WAN round trip per key
+    // (measured 165 of 10,676 resolves snapshot-served on a fresh index).
+    // Re-publishing the fetched manifest bumps the entry back into the view,
+    // so each cold build heals the view for the next machine. Drained a batch
+    // per maintenance tick; deduped for the proxy's lifetime; the server damps
+    // identical re-publishes of entries fresher than a day, so a fleet of
+    // cold machines cannot stampede version bumps.
+    view_refresh: Mutex<VecDeque<ViewRefresh>>,
+    view_refreshed: Mutex<HashSet<Vec<u8>>>,
+
+    // instance -> demand-fetch coalescer, created on first demand miss. Groups
+    // concurrent OP_FETCH_OBJECT blob reads into shared BatchReadBlobs calls.
+    demand_coalescers: Mutex<HashMap<String, Arc<DemandCoalescer>>>,
+
     // Per-node transfer analytics, written to cas_analytics.db for parity with
     // the Swift `CASAnalyticsDatabase`. `None` when no analytics path was configured.
     analytics: Option<crate::analytics::Analytics>,
@@ -537,7 +741,10 @@ impl Proxy {
         registry_path: Option<PathBuf>,
         analytics: Option<crate::analytics::Analytics>,
     ) -> &'static Proxy {
-        let path_instance = registry_path.as_deref().map(load_registry).unwrap_or_default();
+        let path_instance = registry_path
+            .as_deref()
+            .map(load_registry)
+            .unwrap_or_default();
         let proxy: &'static Proxy = Box::leak(Box::new(Proxy {
             grpc_url,
             tokens,
@@ -554,7 +761,9 @@ impl Proxy {
             job_counter: AtomicU64::new(0),
             snapshots: Mutex::new(HashMap::new()),
             unprimed: AtomicU64::new(0),
-
+            view_refresh: Mutex::new(VecDeque::new()),
+            view_refreshed: Mutex::new(HashSet::new()),
+            demand_coalescers: Mutex::new(HashMap::new()),
             analytics,
         }));
         let proxy_addr = proxy as *const Proxy as usize;
@@ -617,7 +826,9 @@ impl Proxy {
     }
 
     fn persist_registry(&self, map: &HashMap<String, String>) {
-        let Some(path) = &self.registry_path else { return };
+        let Some(path) = &self.registry_path else {
+            return;
+        };
         let mut body = String::new();
         for (cas_path, instance) in map {
             if !cas_path.contains(['\t', '\n']) && !instance.contains(['\t', '\n']) {
@@ -749,9 +960,7 @@ impl Proxy {
                     // A fresh miss answers without a round-trip; a stale one
                     // falls through to re-resolve so a key published later
                     // (by another machine) can still land.
-                    Some(Resolution::Miss(at)) if at.elapsed() < NEGATIVE_TTL => {
-                        return Ok(None)
-                    }
+                    Some(Resolution::Miss(at)) if at.elapsed() < NEGATIVE_TTL => return Ok(None),
                     _ => None,
                 };
                 if let Some(value) = peeked {
@@ -772,7 +981,7 @@ impl Proxy {
         // this resolve's marks if a wipe/prune advances the counter mid-resolve.
         self.check_generation(state);
         let observed = state.gen_counter.load(Ordering::SeqCst);
-        let outcome = self.resolve_uncached(remote, state, key, observed);
+        let outcome = self.resolve_uncached(remote, state, key, observed, snapshot.is_some());
         {
             let mut inflight = state.inflight.lock().unwrap();
             inflight.remove(key);
@@ -787,6 +996,7 @@ impl Proxy {
         state: &'static PathState,
         key: &[u8],
         observed: u64,
+        snapshot_ready: bool,
     ) -> Result<Option<Vec<u8>>, String> {
         let op_start = Instant::now();
         let phase = Instant::now();
@@ -814,6 +1024,14 @@ impl Proxy {
             }
         };
         state.stats_remote_hits.fetch_add(1, Ordering::Relaxed);
+        // A per-key hit with a Ready snapshot means this key exists remotely
+        // but fell out of the snapshot's size-capped view; queue its manifest
+        // for a background re-publish so it ranks back in for the next cold
+        // machine. Without a snapshot, per-key is just the normal path and
+        // says nothing about view membership.
+        if snapshot_ready {
+            self.queue_view_refresh(remote, key, &manifest);
+        }
         let action_ms = phase.elapsed().as_millis() as u64;
         state.ms_action.fetch_add(action_ms, Ordering::Relaxed);
 
@@ -1028,8 +1246,11 @@ impl Proxy {
                 } else {
                     state.stats_blobs_fetched.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(instruction) =
-                    state.pending_objects.lock().unwrap().get_mut(&entry.llcas_digest)
+                if let Some(instruction) = state
+                    .pending_objects
+                    .lock()
+                    .unwrap()
+                    .get_mut(&entry.llcas_digest)
                 {
                     instruction.contents = None;
                 }
@@ -1060,19 +1281,44 @@ impl Proxy {
     }
 
     fn materialize_job(&self, item: &[u8]) {
-        let Ok(id_bytes) = <[u8; 8]>::try_from(item) else { return };
+        let Ok(id_bytes) = <[u8; 8]>::try_from(item) else {
+            return;
+        };
         let job = self
             .materialize_jobs
             .lock()
             .unwrap()
             .remove(&u64::from_be_bytes(id_bytes));
         let Some(job) = job else { return };
-        let Ok(state) = self.path_state(&job.cas_path) else { return };
+        let Ok(state) = self.path_state(&job.cas_path) else {
+            return;
+        };
         if let Err(message) =
             self.materialize_manifest(&job.remote, state, &job.manifest, job.observed)
         {
             crate::log_line(&format!("background materialize failed: {message}"));
         }
+    }
+
+    /// The demand-fetch coalescer for an instance, created on first use.
+    fn coalescer_for(&self, instance: &str) -> Arc<DemandCoalescer> {
+        let mut coalescers = self.demand_coalescers.lock().unwrap();
+        coalescers
+            .entry(instance.to_string())
+            .or_insert_with(|| Arc::new(DemandCoalescer::new()))
+            .clone()
+    }
+
+    /// Fetches one blob for a demand load, coalescing with other demand fetches
+    /// in flight for the same instance into a shared `BatchReadBlobs`.
+    fn demand_fetch(
+        &self,
+        instance: &str,
+        remote: &Arc<Remote>,
+        digest: &reapi::Digest,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.coalescer_for(instance)
+            .fetch(digest, |digests| remote.batch_read(digests))
     }
 
     /// Serves one FETCH_OBJECT: a demand load found `digest` missing from the
@@ -1102,7 +1348,10 @@ impl Proxy {
                 .lock()
                 .unwrap()
                 .get(digest)
-                .map(|(blob, _refs)| PendingFetch { blob: blob.clone(), contents: None })
+                .map(|(blob, _refs)| PendingFetch {
+                    blob: blob.clone(),
+                    contents: None,
+                })
         });
         // Third source: the instance's snapshot node table. A restarted proxy
         // has empty maps while Apple's persistent local action cache keeps
@@ -1113,7 +1362,9 @@ impl Proxy {
             Some(pending) => Some(pending),
             None => self.snapshot_fetch_instruction(cas_path, declared_instance, digest),
         };
-        let Some(pending) = pending else { return Ok(false) };
+        let Some(pending) = pending else {
+            return Ok(false);
+        };
         let blob = pending.blob.clone();
         let blob_bytes = match pending.contents {
             Some(bytes) => bytes,
@@ -1122,9 +1373,8 @@ impl Proxy {
                     return Ok(false);
                 };
                 let remote = self.remote_for(&instance);
-                let contents = remote.batch_read(&[blob.clone()])?;
-                match contents.get(&blob.hash) {
-                    Some(bytes) => bytes.clone(),
+                match self.demand_fetch(&instance, &remote, &blob)? {
+                    Some(bytes) => bytes,
                     None => return Ok(false),
                 }
             }
@@ -1145,7 +1395,10 @@ impl Proxy {
             .unwrap()
             .entry(digest.to_vec())
             .and_modify(|instruction| instruction.contents = None)
-            .or_insert(PendingFetch { blob, contents: None });
+            .or_insert(PendingFetch {
+                blob,
+                contents: None,
+            });
         state.stats_demand_fetched.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
@@ -1180,7 +1433,10 @@ impl Proxy {
         };
         let index = *snapshot.node_index.get(digest)?;
         let (_, blob) = &snapshot.nodes[index as usize];
-        Some(PendingFetch { blob: blob.clone(), contents: None })
+        Some(PendingFetch {
+            blob: blob.clone(),
+            contents: None,
+        })
     }
 
     /// Detects a wiped-and-recreated on-disk CAS (a deleted DerivedData under
@@ -1193,7 +1449,9 @@ impl Proxy {
     /// the new generation as unchanged and filter against `known_local` while it
     /// is being cleared.
     fn check_generation(&self, state: &PathState) {
-        let Some(current) = cas_generation(&state.cas_path) else { return };
+        let Some(current) = cas_generation(&state.cas_path) else {
+            return;
+        };
         let mut stored = state.generation.lock().unwrap();
         if generation_changed(*stored, Some(current)) {
             state.invalidate();
@@ -1226,7 +1484,10 @@ impl Proxy {
     /// cached Hit against a wiped local CAS, where the in-memory marks lie.
     fn load_present(&self, state: &PathState, digest: &[u8]) -> bool {
         unsafe {
-            let digest_t = llcas_digest_t { data: digest.as_ptr(), size: digest.len() };
+            let digest_t = llcas_digest_t {
+                data: digest.as_ptr(),
+                size: digest.len(),
+            };
             let mut id = llcas_objectid_t { opaque: 0 };
             let mut error: *mut std::ffi::c_char = std::ptr::null_mut();
             if (state.up.llcas_cas_get_objectid)(state.cas, digest_t, &mut id, &mut error) {
@@ -1263,17 +1524,25 @@ impl Proxy {
     }
 
     fn publish_item(&self, item: &[u8]) {
-        let Some((instance, rest)) = take_u16_field(item) else { return };
-        let Some((cas_path, record_path)) = take_u16_field(rest) else { return };
+        let Some((instance, rest)) = take_u16_field(item) else {
+            return;
+        };
+        let Some((cas_path, record_path)) = take_u16_field(rest) else {
+            return;
+        };
         let instance = String::from_utf8_lossy(instance).into_owned();
         let cas_path = String::from_utf8_lossy(cas_path).into_owned();
         let record_path = String::from_utf8_lossy(record_path).into_owned();
         let remote = self.remote_for(&instance);
-        let Ok(state) = self.path_state(&cas_path) else { return };
+        let Ok(state) = self.path_state(&cas_path) else {
+            return;
+        };
         state
             .last_used
             .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-        let Ok(bytes) = std::fs::read(&record_path) else { return };
+        let Ok(bytes) = std::fs::read(&record_path) else {
+            return;
+        };
         let Some(record) =
             PublishRecord::decode_body(&bytes, Some(std::path::PathBuf::from(&record_path)))
         else {
@@ -1296,11 +1565,10 @@ impl Proxy {
             Ok(()) => {
                 let _ = std::fs::remove_file(&record_path);
                 state.stats_published.fetch_add(1, Ordering::Relaxed);
-                state
-                    .resolved
-                    .lock()
-                    .unwrap()
-                    .insert(record.key.clone(), Resolution::Hit(record.value_digest.clone()));
+                state.resolved.lock().unwrap().insert(
+                    record.key.clone(),
+                    Resolution::Hit(record.value_digest.clone()),
+                );
             }
             Err(reason) => {
                 crate::log_line(&format!("proxy publish failed ({reason}); record kept"));
@@ -1335,7 +1603,11 @@ impl Proxy {
             if let Some((blob_digest, children)) =
                 state.publish_cache.lock().unwrap().get(&digest).cloned()
             {
-                entries.push(ManifestEntry { llcas_digest: digest, blob: blob_digest, contents: None });
+                entries.push(ManifestEntry {
+                    llcas_digest: digest,
+                    blob: blob_digest,
+                    contents: None,
+                });
                 blobs.push(None);
                 pending.extend(children);
                 continue;
@@ -1347,7 +1619,11 @@ impl Proxy {
                 .lock()
                 .unwrap()
                 .insert(digest.clone(), (blob_digest.clone(), children.clone()));
-            entries.push(ManifestEntry { llcas_digest: digest, blob: blob_digest, contents: None });
+            entries.push(ManifestEntry {
+                llcas_digest: digest,
+                blob: blob_digest,
+                contents: None,
+            });
             blobs.push(Some(blob));
             pending.extend(children);
         }
@@ -1371,9 +1647,16 @@ impl Proxy {
             };
             if self.analytics.is_some() {
                 let (size, data) = reapi::decompress_frame(&bytes)
-                    .and_then(|frame| reapi::decode_frame(&frame).map(|node| (frame.len(), node.data)))
+                    .and_then(|frame| {
+                        reapi::decode_frame(&frame).map(|node| (frame.len(), node.data))
+                    })
                     .unwrap_or((bytes.len(), Vec::new()));
-                upload_meta.push((entry.llcas_digest.clone(), size as i64, entry.blob.size_bytes, data));
+                upload_meta.push((
+                    entry.llcas_digest.clone(),
+                    size as i64,
+                    entry.blob.size_bytes,
+                    data,
+                ));
             }
             uploads.push((entry.blob.clone(), bytes));
         }
@@ -1467,14 +1750,17 @@ impl Proxy {
                 continue;
             };
             let spool = std::path::Path::new(&cas_path).join("tuist-spool");
-            let Ok(entries) = std::fs::read_dir(&spool) else { continue };
+            let Ok(entries) = std::fs::read_dir(&spool) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     // Claims are ours alone now; reclaim anything.
                     let base = name.split_once(".claim-").map(|(b, _)| b.to_string());
                     let path = match base {
                         Some(base) => {
-                            let claimed = spool.join(format!("{base}.claim-{}", std::process::id()));
+                            let claimed =
+                                spool.join(format!("{base}.claim-{}", std::process::id()));
                             if std::fs::rename(entry.path(), &claimed).is_err() {
                                 continue;
                             }
@@ -1496,6 +1782,54 @@ impl Proxy {
         self.tokens.refresh_if_expiring(lead);
     }
 
+    /// Queues a per-key-served manifest for a background re-publish (see
+    /// `Proxy.view_refresh`). Inlined contents are stripped: the refresh only
+    /// re-sends the llcas→blob mapping, and the blobs are already on the
+    /// server (the per-key hit proved the entry serveable).
+    fn queue_view_refresh(&self, remote: &Arc<Remote>, key: &[u8], manifest: &[ManifestEntry]) {
+        {
+            let mut refreshed = self.view_refreshed.lock().unwrap();
+            if refreshed.len() >= VIEW_REFRESH_MAX_QUEUE || !refreshed.insert(key.to_vec()) {
+                return;
+            }
+        }
+        let stripped: Vec<ManifestEntry> = manifest
+            .iter()
+            .map(|entry| ManifestEntry {
+                llcas_digest: entry.llcas_digest.clone(),
+                blob: entry.blob.clone(),
+                contents: None,
+            })
+            .collect();
+        let mut queue = self.view_refresh.lock().unwrap();
+        if queue.len() < VIEW_REFRESH_MAX_QUEUE {
+            queue.push_back((remote.clone(), key.to_vec(), stripped));
+        }
+    }
+
+    /// Drains a batch of queued view refreshes, one small UpdateActionResult
+    /// each. Best-effort: a failure drops the batch's remainder — the next
+    /// cold build that pays the per-key round trip re-queues the key.
+    pub fn refresh_view_keys(&self) {
+        let mut sent = 0_usize;
+        while sent < VIEW_REFRESH_PER_TICK {
+            let Some((remote, key, manifest)) = self.view_refresh.lock().unwrap().pop_front()
+            else {
+                break;
+            };
+            if remote.update_action(&key, &manifest).is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        if sent > 0 {
+            let remaining = self.view_refresh.lock().unwrap().len();
+            crate::log_line(&format!(
+                "view refresh: {sent} keys re-published ({remaining} queued)"
+            ));
+        }
+    }
+
     /// Kicks off snapshot fetches for every instance the persisted registry
     /// knows. Called once at proxy startup, so a machine's first build after
     /// a restart already has the snapshot (and its bulk warm) in flight
@@ -1503,8 +1837,13 @@ impl Proxy {
     /// start on the first resolve, which put the transfer and the server's
     /// first index build inside the build the user was waiting on.
     pub fn prefetch_known_snapshots(&self) {
-        let instances: std::collections::HashSet<String> =
-            self.path_instance.lock().unwrap().values().cloned().collect();
+        let instances: std::collections::HashSet<String> = self
+            .path_instance
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
         for instance in instances {
             let remote = self.remote_for(&instance);
             self.ensure_snapshot(&instance, &remote);
@@ -1556,13 +1895,22 @@ impl Proxy {
                     crate::log_line(&format!(
                         "snapshot: undecodable payload for {instance}; staying on the per-key path"
                     ));
-                    SnapshotState::Absent { checked: Instant::now() }
+                    SnapshotState::Absent {
+                        checked: Instant::now(),
+                        retry_after: SNAPSHOT_RETRY_INTERVAL,
+                    }
                 }
             },
-            Ok(None) => SnapshotState::Absent { checked: Instant::now() },
+            Ok(None) => SnapshotState::Absent {
+                checked: Instant::now(),
+                retry_after: SNAPSHOT_RETRY_INTERVAL,
+            },
             Err(message) => {
                 crate::log_line(&format!("snapshot fetch failed for {instance}: {message}"));
-                SnapshotState::Absent { checked: Instant::now() }
+                SnapshotState::Absent {
+                    checked: Instant::now(),
+                    retry_after: SNAPSHOT_ERROR_RETRY_INTERVAL,
+                }
             }
         }
     }
@@ -1614,7 +1962,9 @@ impl Proxy {
                         ..
                     } => {
                         if now.duration_since(*full_at) > SNAPSHOT_FULL_INTERVAL {
-                            plans.push(Plan::Full { instance: instance.clone() });
+                            plans.push(Plan::Full {
+                                instance: instance.clone(),
+                            });
                         } else if now.duration_since(*refreshed_at) > SNAPSHOT_DELTA_INTERVAL {
                             plans.push(Plan::Delta {
                                 instance: instance.clone(),
@@ -1622,10 +1972,13 @@ impl Proxy {
                             });
                         }
                     }
-                    SnapshotState::Absent { checked }
-                        if now.duration_since(*checked) > SNAPSHOT_RETRY_INTERVAL =>
-                    {
-                        plans.push(Plan::Full { instance: instance.clone() });
+                    SnapshotState::Absent {
+                        checked,
+                        retry_after,
+                    } if now.duration_since(*checked) > *retry_after => {
+                        plans.push(Plan::Full {
+                            instance: instance.clone(),
+                        });
                     }
                     _ => {}
                 }
@@ -1638,11 +1991,16 @@ impl Proxy {
                     let outcome = self.fetch_full_snapshot(&instance, &remote);
                     self.snapshots.lock().unwrap().insert(instance, outcome);
                 }
-                Plan::Delta { instance, watermark } => {
+                Plan::Delta {
+                    instance,
+                    watermark,
+                } => {
                     let remote = self.remote_for(&instance);
                     match remote.get_snapshot(Some(watermark)) {
                         Ok(Some(bytes)) => {
-                            let Some(delta) = Snapshot::decode(&bytes) else { continue };
+                            let Some(delta) = Snapshot::decode(&bytes) else {
+                                continue;
+                            };
                             let warm = {
                                 let mut snapshots = self.snapshots.lock().unwrap();
                                 let Some(SnapshotState::Ready {
@@ -1719,7 +2077,9 @@ impl Proxy {
             .collect();
         let remote = self.remote_for(instance);
         for cas_path in cas_paths {
-            let Ok(state) = self.path_state(&cas_path) else { continue };
+            let Ok(state) = self.path_state(&cas_path) else {
+                continue;
+            };
             let observed = state.gen_counter.load(Ordering::SeqCst);
             // Warm newest-first (the wire order) and stop at the node budget:
             // a shared namespace's snapshot carries every project's history,
@@ -1730,7 +2090,9 @@ impl Proxy {
             let mut budget = PREMATERIALIZE_MAX_NODES;
             let mut enqueued = 0usize;
             for key_hash in &snapshot.key_order {
-                let Some(manifest) = snapshot.manifest(key_hash) else { continue };
+                let Some(manifest) = snapshot.manifest(key_hash) else {
+                    continue;
+                };
                 budget = budget.saturating_sub(manifest.len());
                 let id = self.job_counter.fetch_add(1, Ordering::Relaxed);
                 self.materialize_jobs.lock().unwrap().insert(
@@ -1759,7 +2121,11 @@ impl Proxy {
 
     fn snapshot_ready(&self, instance: &str) -> Option<Arc<Snapshot>> {
         match self.snapshots.lock().unwrap().get_mut(instance) {
-            Some(SnapshotState::Ready { snapshot, last_used, .. }) => {
+            Some(SnapshotState::Ready {
+                snapshot,
+                last_used,
+                ..
+            }) => {
                 *last_used = Instant::now();
                 Some(snapshot.clone())
             }
@@ -1820,7 +2186,11 @@ impl Proxy {
         // A plugin from a different CLI version speaks a different frame layout;
         // reject rather than misparse, so the plugin degrades to a local miss.
         if request.version != crate::proxy_proto::PROTOCOL_VERSION {
-            return write_response(&mut stream, STATUS_ERROR, b"proxy protocol version mismatch");
+            return write_response(
+                &mut stream,
+                STATUS_ERROR,
+                b"proxy protocol version mismatch",
+            );
         }
         match request.op {
             OP_RESOLVE => {
@@ -1836,11 +2206,9 @@ impl Proxy {
                 let remote = self.remote_for(&instance);
                 self.ensure_snapshot(&instance, &remote);
                 let snapshot = self.snapshot_ready(&instance);
-                let outcome = self
-                    .path_state(&request.cas_path)
-                    .and_then(|state| {
-                        self.resolve(&remote, state, &request.payload, snapshot.as_deref())
-                    });
+                let outcome = self.path_state(&request.cas_path).and_then(|state| {
+                    self.resolve(&remote, state, &request.payload, snapshot.as_deref())
+                });
                 match outcome {
                     Ok(Some(value)) => write_response(&mut stream, STATUS_HIT, &value),
                     Ok(None) => write_response(&mut stream, STATUS_MISS, &[]),
@@ -1853,7 +2221,8 @@ impl Proxy {
             OP_PUBLISH => {
                 // Ack even when unprimed: the record stays spooled for a later
                 // sweep once a build primes the instance.
-                if let Some(instance) = self.resolve_instance(&request.cas_path, &request.instance) {
+                if let Some(instance) = self.resolve_instance(&request.cas_path, &request.instance)
+                {
                     let record_path = String::from_utf8_lossy(&request.payload).into_owned();
                     self.enqueue_publish(&request.cas_path, &instance, &record_path);
                 } else {
@@ -1880,7 +2249,18 @@ impl Proxy {
                 // produce pruned objects (fetch_object reconstructs the
                 // instruction from the instance snapshot). An unroutable
                 // request stays a miss without opening a CAS handle.
-                let state = match self.paths.lock().unwrap().get(&request.cas_path).copied() {
+                //
+                // The lookup MUST release the `paths` guard before the match
+                // runs: a match scrutinee's temporary lives across every arm,
+                // and the fallback arm re-enters `path_state` — a self-
+                // deadlock on the non-reentrant `paths` mutex — and takes
+                // `path_instance` while holding `paths`, inverting the
+                // resolve path's lock order. One unroutable demand fetch
+                // wedged the whole proxy permanently (165 threads parked,
+                // every build on the machine silently degraded to cache-less
+                // compiles).
+                let known = self.paths.lock().unwrap().get(&request.cas_path).copied();
+                let state = match known {
                     Some(state) => Ok(Some(state)),
                     None if self
                         .resolve_instance(&request.cas_path, &request.instance)
@@ -1942,8 +2322,7 @@ fn load_registry(path: &Path) -> HashMap<String, String> {
 
 unsafe fn open_cas(up: &'static Upstream, path: &str) -> Result<llcas_cas_t, String> {
     let options = (up.llcas_cas_options_create)();
-    let c_path =
-        std::ffi::CString::new(path).map_err(|_| "bad cas path".to_string())?;
+    let c_path = std::ffi::CString::new(path).map_err(|_| "bad cas path".to_string())?;
     (up.llcas_cas_options_set_client_version)(options, 0, 1);
     (up.llcas_cas_options_set_ondisk_path)(options, c_path.as_ptr());
     let mut error: *mut std::ffi::c_char = std::ptr::null_mut();
@@ -1953,7 +2332,9 @@ unsafe fn open_cas(up: &'static Upstream, path: &str) -> Result<llcas_cas_t, Str
         let message = if error.is_null() {
             "cas_create failed".to_string()
         } else {
-            let text = std::ffi::CStr::from_ptr(error).to_string_lossy().into_owned();
+            let text = std::ffi::CStr::from_ptr(error)
+                .to_string_lossy()
+                .into_owned();
             (up.llcas_string_dispose)(error);
             text
         };
@@ -1965,7 +2346,10 @@ unsafe fn open_cas(up: &'static Upstream, path: &str) -> Result<llcas_cas_t, Str
 unsafe fn store_node(state: &PathState, node: &reapi::Node) -> Result<(), String> {
     let mut ref_ids = Vec::with_capacity(node.refs.len());
     for reference in &node.refs {
-        let digest = llcas_digest_t { data: reference.as_ptr(), size: reference.len() };
+        let digest = llcas_digest_t {
+            data: reference.as_ptr(),
+            size: reference.len(),
+        };
         let mut id = llcas_objectid_t { opaque: 0 };
         let mut error: *mut std::ffi::c_char = std::ptr::null_mut();
         if (state.up.llcas_cas_get_objectid)(state.cas, digest, &mut id, &mut error) {
@@ -2003,7 +2387,10 @@ unsafe fn encode_node_blob(
     state: &PathState,
     digest: &[u8],
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
-    let digest_t = llcas_digest_t { data: digest.as_ptr(), size: digest.len() };
+    let digest_t = llcas_digest_t {
+        data: digest.as_ptr(),
+        size: digest.len(),
+    };
     let mut id = llcas_objectid_t { opaque: 0 };
     let mut id_error: *mut std::ffi::c_char = std::ptr::null_mut();
     if (state.up.llcas_cas_get_objectid)(state.cas, digest_t, &mut id, &mut id_error) {
@@ -2073,7 +2460,10 @@ mod tests {
         assert!(snapshot.manifest(&[6u8; 32]).is_none());
         // The per-node lookup fetch_object's snapshot fallback uses: llcas
         // digest -> the node's blob digest.
-        let index = *snapshot.node_index.get(&vec![0xCCu8]).expect("node indexed");
+        let index = *snapshot
+            .node_index
+            .get(&vec![0xCCu8])
+            .expect("node indexed");
         assert_eq!(snapshot.nodes[index as usize].1.size_bytes, 20);
         assert!(!snapshot.node_index.contains_key(&vec![0xFFu8]));
 
@@ -2115,6 +2505,138 @@ mod tests {
         // and merged delta keys — the newest — move to the front of it.
         assert_eq!(snapshot.key_order, vec![[5u8; 32]]);
         assert_eq!(merged.key_order, vec![[9u8; 32], [5u8; 32]]);
+    }
+
+    #[test]
+    fn snapshot_decodes_the_compressed_envelope() {
+        // A minimal valid TSNP body: one node, one key referencing it.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"TSNP");
+        body.push(2);
+        body.extend_from_slice(&555u64.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.push(1);
+        body.push(0xAB);
+        body.extend_from_slice(&[7u8; 32]);
+        body.extend_from_slice(&10u64.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[5u8; 32]);
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+
+        // Wrap it in the TSNZ envelope the way kura does and confirm the client
+        // decodes the compressed and plain forms identically.
+        let compressed = zstd::stream::encode_all(&body[..], 3).unwrap();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"TSNZ");
+        wire.push(1);
+        wire.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        wire.extend_from_slice(&compressed);
+
+        let from_zstd = Snapshot::decode(&wire).expect("compressed decodes");
+        let from_plain = Snapshot::decode(&body).expect("plain decodes");
+        assert_eq!(from_zstd.watermark, 555);
+        assert_eq!(from_zstd.watermark, from_plain.watermark);
+        assert_eq!(from_zstd.nodes.len(), from_plain.nodes.len());
+        assert!(from_zstd.manifest(&[5u8; 32]).is_some());
+
+        // A declared length that disagrees with the real body is a torn
+        // payload: refuse rather than serve a half-decoded view.
+        let mut wrong_len = wire.clone();
+        wrong_len[5..13].copy_from_slice(&(body.len() as u64 + 1).to_le_bytes());
+        assert!(Snapshot::decode(&wrong_len).is_none());
+
+        // An absurd declared length must be rejected before allocating.
+        let mut huge = wire.clone();
+        huge[5..13].copy_from_slice(&(u64::MAX).to_le_bytes());
+        assert!(Snapshot::decode(&huge).is_none());
+
+        // Zip bomb: a stream that expands far past a small declared length must
+        // be rejected — and the bounded decode stops one byte past `declared`
+        // rather than expanding the whole stream. The stream here inflates to
+        // 100 KiB while the envelope claims 8 bytes.
+        let bomb_body = vec![0u8; 100 * 1024];
+        let bomb_stream = zstd::stream::encode_all(&bomb_body[..], 3).unwrap();
+        let mut bomb = Vec::new();
+        bomb.extend_from_slice(b"TSNZ");
+        bomb.push(1);
+        bomb.extend_from_slice(&8u64.to_le_bytes());
+        bomb.extend_from_slice(&bomb_stream);
+        assert!(Snapshot::decode(&bomb).is_none());
+    }
+
+    #[test]
+    fn demand_coalescer_routes_concurrent_fetches_correctly() {
+        use std::sync::atomic::AtomicUsize;
+
+        let coalescer = Arc::new(DemandCoalescer::new());
+        // Sums digests.len() over every batch call: with each hash fetched at
+        // most once, coalescing can only lower the CALL count, never change
+        // this sum — so a total above the worker count would mean a hash was
+        // fetched twice, and below it would mean one was dropped.
+        let fetched_total = Arc::new(AtomicUsize::new(0));
+
+        let digest = |n: u8| reapi::Digest {
+            hash: reapi::hex(&[n; 32]),
+            size_bytes: 3,
+        };
+
+        let mut handles = Vec::new();
+        for n in 0..8u8 {
+            let coalescer = coalescer.clone();
+            let fetched_total = fetched_total.clone();
+            handles.push(std::thread::spawn(move || {
+                coalescer
+                    .fetch(&digest(n), |digests| {
+                        fetched_total.fetch_add(digests.len(), Ordering::SeqCst);
+                        Ok(digests
+                            .iter()
+                            .map(|d| (d.hash.clone(), d.hash.clone().into_bytes()))
+                            .collect())
+                    })
+                    .expect("fetch succeeds")
+                    .expect("blob present")
+            }));
+        }
+        for (n, handle) in handles.into_iter().enumerate() {
+            let bytes = handle.join().unwrap();
+            assert_eq!(
+                bytes,
+                digest(n as u8).hash.into_bytes(),
+                "each worker gets its own blob"
+            );
+        }
+        assert_eq!(
+            fetched_total.load(Ordering::SeqCst),
+            8,
+            "every hash fetched exactly once across all batches"
+        );
+    }
+
+    #[test]
+    fn demand_coalescer_reports_missing_and_failure_per_waiter() {
+        let coalescer = DemandCoalescer::new();
+        let present = reapi::Digest {
+            hash: reapi::hex(&[1; 32]),
+            size_bytes: 3,
+        };
+        // A hash the batch read does not return is a miss (Ok(None)).
+        let missing = coalescer
+            .fetch(&present, |_| Ok(HashMap::new()))
+            .expect("no transport error");
+        assert!(missing.is_none(), "absent blob is a miss");
+
+        // A present hash returns its bytes.
+        let hit = coalescer
+            .fetch(&present, |d| {
+                Ok(d.iter().map(|d| (d.hash.clone(), vec![0xAB])).collect())
+            })
+            .expect("no transport error");
+        assert_eq!(hit, Some(vec![0xAB]));
+
+        // A transport error surfaces to the caller.
+        let err = coalescer.fetch(&present, |_| Err("boom".to_string()));
+        assert_eq!(err.unwrap_err(), "boom");
     }
 
     fn resolved_with(entries: Vec<(Vec<u8>, Resolution)>) -> Mutex<HashMap<Vec<u8>, Resolution>> {
@@ -2229,7 +2751,10 @@ mod tests {
     #[test]
     fn active_path_is_not_reclaimed() {
         assert!(!should_reclaim(Duration::from_secs(0), false));
-        assert!(!should_reclaim(IDLE_RECLAIM - Duration::from_secs(1), false));
+        assert!(!should_reclaim(
+            IDLE_RECLAIM - Duration::from_secs(1),
+            false
+        ));
     }
 
     // A present path idle past IDLE_RECLAIM is reclaimed.
@@ -2259,8 +2784,14 @@ mod tests {
         assert!(generation_changed(Some(g1), Some(g2)));
         assert!(generation_changed(Some(g2), Some(g1)));
         assert!(!generation_changed(Some(g1), Some(g1)));
-        assert!(!generation_changed(None, Some(g1)), "first observation is not a change");
-        assert!(!generation_changed(Some(g1), None), "a gone dir is left to reclaim_idle");
+        assert!(
+            !generation_changed(None, Some(g1)),
+            "first observation is not a change"
+        );
+        assert!(
+            !generation_changed(Some(g1), None),
+            "a gone dir is left to reclaim_idle"
+        );
     }
 
     // A resolve's writes commit only if the generation it observed still holds;
@@ -2268,7 +2799,10 @@ mod tests {
     #[test]
     fn writes_commit_only_on_the_observed_generation() {
         assert!(committable(7, 7));
-        assert!(!committable(7, 8), "an advanced generation must drop stale writes");
+        assert!(
+            !committable(7, 8),
+            "an advanced generation must drop stale writes"
+        );
     }
 
     // Keylog lines round-trip: lowercase hex parses back to the raw key; blank
@@ -2292,6 +2826,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(before.is_some() && after.is_some());
-        assert_ne!(before, after, "a recreated CAS directory must read as a new generation");
+        assert_ne!(
+            before, after,
+            "a recreated CAS directory must read as a new generation"
+        );
     }
 }
